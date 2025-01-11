@@ -1,0 +1,213 @@
+# GCN Model Synthetic Data
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Input, Reshape
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+def calculate_laplacian_with_self_loop(adjacency):
+    """
+    Calculate the normalized Laplacian matrix with self-loops for GCN.
+    """
+    # Add self-loops to the adjacency matrix
+    num_nodes = tf.shape(adjacency)[0]
+    self_loop = tf.eye(num_nodes, dtype=adjacency.dtype)
+    adjacency_with_loop = adjacency + self_loop
+    
+    # Calculate degree matrix
+    degree = tf.reduce_sum(adjacency_with_loop, axis=1)
+    degree = tf.maximum(degree, 1e-7)  # Prevent division by zero
+    
+    # Calculate D^(-1/2)
+    degree_inv_sqrt = tf.pow(degree, -0.5)
+    degree_inv_sqrt = tf.where(tf.math.is_inf(degree_inv_sqrt), 0., degree_inv_sqrt)
+    degree_inv_sqrt = tf.linalg.diag(degree_inv_sqrt)
+    
+    # Calculate normalized Laplacian: L = D^(-1/2) A D^(-1/2)
+    normalized_laplacian = tf.matmul(tf.matmul(degree_inv_sqrt, adjacency_with_loop), degree_inv_sqrt)
+    
+    return normalized_laplacian
+
+def monotonicity_regularization(y_pred, X, monotonic_indices):
+    """
+    Calculate monotonicity regularization term.
+    """
+    violations = tf.constant(0.0)
+    for idx in monotonic_indices:
+        sorted_indices = tf.argsort(X[:, idx])
+        sorted_predictions = tf.gather(y_pred, sorted_indices)
+        violations += tf.reduce_sum(tf.square(tf.maximum(0.0, -(sorted_predictions[1:] - sorted_predictions[:-1]))))
+    return violations / tf.cast(tf.shape(X)[0], tf.float32)
+
+def custom_loss(X_train_scaled, lam, monotonic_indices):
+    """
+    Custom loss function combining MSE and monotonicity regularization.
+    """
+    def loss(y_true, y_pred):
+        mse = tf.keras.losses.mean_squared_error(y_true, y_pred)
+        reg = monotonicity_regularization(y_pred, X_train_scaled, monotonic_indices)
+        return mse + lam * reg
+    return loss
+
+def create_gcn_model(input_shape, adj_matrix, X_train_scaled, monotonic_indices, lam, learning_rate):
+    """
+    Create and compile GCN model.
+    """
+    laplacian = calculate_laplacian_with_self_loop(tf.convert_to_tensor(adj_matrix, dtype=tf.float32))
+    
+    inputs = Input(shape=(input_shape,))
+    x = Reshape((input_shape, 1))(inputs)
+    x = tf.linalg.matmul(laplacian, x)
+    x = Dense(128, activation='relu')(x)
+    x = Dense(64, activation='relu')(x)
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    outputs = Dense(1)(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate), 
+        loss=custom_loss(X_train_scaled, lam, monotonic_indices)
+    )
+    return model
+
+def train_and_evaluate(X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_test,
+                      adj_matrix, monotonic_indices, lam, batch_size, learning_rate, epochs, target_scaler):
+    """
+    Train and evaluate the GCN model.
+    """
+    model = create_gcn_model(
+        X_train_scaled.shape[1], 
+        adj_matrix, 
+        X_train_scaled,
+        monotonic_indices, 
+        lam, 
+        learning_rate
+    )
+
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=50,
+        restore_best_weights=True
+    )
+    
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=20,
+        min_lr=0.0001
+    )
+
+    history = model.fit(
+        X_train_scaled, 
+        y_train_scaled,
+        validation_data=(X_test_scaled, y_test_scaled),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[early_stopping, reduce_lr],
+        verbose=0
+    )
+
+    predictions_scaled = model.predict(X_test_scaled)
+    predictions = target_scaler.inverse_transform(predictions_scaled)
+    mse = mean_squared_error(y_test, predictions)
+
+    return mse, model, predictions
+
+def main():
+    # Load and preprocess data
+    file_path = './synthetic_data.csv'
+    data = pd.read_csv(file_path)
+    data = data.dropna()
+
+    X = data.drop(columns=['total_number_trips', 'Unnamed: 0'])
+    y = data['total_number_trips'] / 101
+
+    # Define monotonic features
+    monotonic_features = [
+        'downtown_downtown',
+        'EmpDen_Des',
+        'EmpDen_Ori',
+        'Commuters_HW',
+        'Commuters_WH'
+    ]
+    monotonic_indices = [X.columns.get_loc(col) for col in monotonic_features]
+
+    # Split and scale data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    target_scaler = StandardScaler()
+    y_train_scaled = target_scaler.fit_transform(y_train.values.reshape(-1, 1)).flatten()
+    y_test_scaled = target_scaler.transform(y_test.values.reshape(-1, 1)).flatten()
+
+    # Initialize adjacency matrix
+    adj_matrix = np.identity(X_train_scaled.shape[1])
+
+    # Train base model
+    base_mse, base_model, base_predictions = train_and_evaluate(
+        X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_test,
+        adj_matrix, [], 0, batch_size=32, learning_rate=0.001, epochs=500,
+        target_scaler=target_scaler  # Added target_scaler parameter
+    )
+
+    # Evaluate different λ values
+    lam_values = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    multi_feature_results = []
+    single_feature_results = {feature: [] for feature in monotonic_features}
+
+    for lam in lam_values:
+        if lam == 0:
+            multi_mse = base_mse
+            multi_predictions = base_predictions
+        else:
+            multi_mse, multi_model, multi_predictions = train_and_evaluate(
+                X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_test,
+                adj_matrix, monotonic_indices, lam, batch_size=32, learning_rate=0.001, epochs=500,
+                target_scaler=target_scaler  # Added target_scaler parameter
+            )
+        
+        multi_feature_results.append({'lam': lam, 'mse': multi_mse})
+        
+        # Evaluate single feature monotonicity
+        for feature in monotonic_features:
+            single_index = [X.columns.get_loc(feature)]
+            if lam == 0:
+                single_mse = base_mse
+            else:
+                single_mse, _, _ = train_and_evaluate(
+                    X_train_scaled, y_train_scaled, X_test_scaled, y_test_scaled, y_test,
+                    adj_matrix, single_index, lam, batch_size=32, learning_rate=0.001, epochs=500,
+                    target_scaler=target_scaler  # Added target_scaler parameter
+                )
+            single_feature_results[feature].append({'lam': lam, 'mse': single_mse})
+        
+        print(f"Lambda: {lam}")
+        print(f"Multi-Feature MSE: {multi_mse}")
+        for feature in monotonic_features:
+            print(f"{feature} Single-Feature MSE: {single_feature_results[feature][-1]['mse']}")
+        print()
+
+    # Print final results
+    print("Multi-Feature Results:")
+    print(pd.DataFrame(multi_feature_results))
+
+    for feature in monotonic_features:
+        print(f"\n{feature} Single-Feature Results:")
+        print(pd.DataFrame(single_feature_results[feature]))
+
+if __name__ == "__main__":
+    main()
