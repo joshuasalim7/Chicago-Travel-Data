@@ -1,0 +1,39 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import ks_2samp
+
+# Load the original dataset
+original_df = pd.read_csv('./alldata_downtownTodowntown.csv')
+
+# Define function to generate synthetic data using bootstrap sampling
+def generate_synthetic_data_bootstrap(original_df):
+    np.random.seed(42)  # For reproducibility
+    n_rows = len(original_df)
+    
+    # Bootstrap sampling from original data
+    synthetic_df = original_df.sample(n=n_rows, replace=True).reset_index(drop=True)
+    
+    return synthetic_df
+
+# Generate synthetic data using bootstrap sampling
+synthetic_df = generate_synthetic_data_bootstrap(original_df)
+
+# Define function to perform KS test for each column in two datasets
+def ks_test_columns(original_df, synthetic_df):
+    results = {}
+    for column in original_df.columns:
+        if column in synthetic_df.columns and original_df[column].dtype in ['float64', 'int64']:  # Only test numerical columns
+            stat, p_value = ks_2samp(original_df[column], synthetic_df[column])
+            results[column] = {'KS Statistic': stat, 'p-value': p_value}
+    return pd.DataFrame(results).T
+
+# Run KS test between original and synthetic datasets
+ks_results = ks_test_columns(original_df, synthetic_df)
+
+# Set Pandas to display all rows
+pd.set_option('display.max_rows', None)
+
+# Display KS test results
+print(ks_results)
+
+synthetic_df.to_csv('synthetic_data.csv')
